@@ -1,4 +1,13 @@
-;;; genstruct
+;; Copyright (c) 2009 Roland Sadowski. All rights reserved.  The use and
+;; distribution terms for this software are covered by the Common
+;; Public License 1.0 (http://www.opensource.org/licenses/cpl1.0.php)
+;; which can be found in the file CPL.TXT at the root of this
+;; distribution.  By using this software in any fashion, you are
+;; agreeing to be bound by the terms of this license.  You must not
+;; remove this notice, or any other, from this software. 
+
+;;; gen-struct macro and some of the helper functions are based
+;;; on the code in genstruct.clj written by Rich Hickey, creator of Clojure.
 
 (ns rosado.genstruct
   (:import (java.lang.reflect Modifier Constructor)
@@ -20,6 +29,17 @@
       'byte Byte/TYPE
       'char Character/TYPE})
 
+(def #^{:private true} prim->desc
+     {'int "I"
+      'long "J"
+      'float "F"
+      'double "D"
+      'short "S"
+      'boolean "Z"
+      'byte "B"
+      'char "C"
+      })
+
 (defn- #^Class the-class [x]            ; copied from genclass.clj
   (cond 
     (class? x) x
@@ -30,164 +50,158 @@
                strx
                (str "java.lang." strx))))))
 
-(defn generate-struct [options-map]
-  (let [default-options {:load-impl-ns true :impl-ns (ns-name *ns*)}
-        {:keys [name factory load-impl-ns impl-ns]} 
+(defn- #^String the-descriptor[x]
+  (cond
+    (contains? prim->desc x) (prim->desc x)
+    :else (Type/getDescriptor (the-class x))))
+
+(defn- static? [fieldspec]
+  (some #{'static} fieldspec))
+
+(defn- validate-options [options]
+  (let [{:keys [mutable-fields final-fields]} options
+        volatile? #(some #{'volatile} %)]
+    (when (some static? mutable-fields)
+      (throw (new Exception "Can't create 'static' instance fields.")))
+    (when (or (some volatile? mutable-fields)
+              (some volatile? final-fields))
+      (throw (new Exception "'volatile' is not supported")))))
+
+(defn- generate-struct
+  [options-map]
+  (println "generate-struct")
+  (let [default-options {}
+        {:keys [name mutable-fields final-fields]} 
         (merge default-options options-map)
         name (str name)
         super Object
         cv (new ClassWriter (. ClassWriter COMPUTE_MAXS))
         cname (. name (replace "." "/"))
         pkg-name name
-        impl-pkg-name (str impl-ns)
-        impl-cname (.. impl-pkg-name (replace "." "/") (replace \- \_))
         ctype (. Type (getObjectType cname))
         iname (fn [#^Class c] (.. Type (getType c) (getInternalName)))
         totype (fn [#^Class c] (. Type (getType c)))
-        emit-ctor (fn []
-                    (let [m (Method/getMethod "void <init>()")
+        to-types (fn [cs] (if (pos? (count cs))
+                            (into-array (map totype cs))
+                            (make-array Type 0)))
+        non-static-finals (filter (complement #(some #{'static} %)) final-fields)
+        rm-static #(remove #{'static} %)
+        emit-ctor (fn [args]
+                    (let [argtypes (to-types (map first args))
+                          m (new Method "<init>" (. Type VOID_TYPE) argtypes)
+                          supm (new Method "<init>" (. Type VOID_TYPE) (to-types nil))
                           mg (new GeneratorAdapter (Opcodes/ACC_PUBLIC) m nil nil cv)]
                       (.loadThis mg)
-                      (.invokeConstructor mg (totype super) m)
+                      (.invokeConstructor mg (totype super) supm)
+                      (doseq [i (range (count args))]
+                        (.loadThis mg)
+                        (.loadArg mg i)
+                        (.putField mg ctype (second (nth args i)) (aget argtypes i)))
                       (.returnValue mg)
-                      (.endMethod mg)))]
+                      (.endMethod mg)))
+        emit-field (fn [access [type-symbol fld-name] & default-val]
+                     (let [vl (if (and (seq default-val) (contains? prim->desc type-symbol))
+                                (list type-symbol (first default-val))
+                                (first default-val))
+                           v (when vl (eval vl))]
+                       (. cv (visitField access (str fld-name) (the-descriptor type-symbol) nil v))
+                       (. cv visitEnd )))
+        split-fields (fn [specs]
+                       (loop [sp (first specs) specs (rest specs) st [] inst []]
+                         (if sp
+                           (if (static? sp)
+                             (recur (first specs) (rest specs) (conj st (rm-static sp)) inst)
+                             (recur (first specs) (rest specs) st (conj inst sp)))
+                           [st inst])))
+        [mutables static+mutables] (split-fields mutable-fields)
+        [static+finals finals] (split-fields final-fields)
+        ]
+    (validate-options options-map)
     (. cv (visit (. Opcodes V1_5) (+ (. Opcodes ACC_PUBLIC) (. Opcodes ACC_SUPER))
                  cname nil (iname super) nil))
-    (emit-ctor)
-    (. cv visitEnd )
+    (when mutable-fields
+      (doseq [spec mutables]
+        (emit-field (. Opcodes ACC_PUBLIC) spec))
+      (doseq [spec static+mutables]
+        (emit-field (+ (. Opcodes ACC_PUBLIC) (. Opcodes ACC_STATIC)) spec)))
+    (when final-fields
+      (doseq [spec finals]
+        (emit-field (+ (. Opcodes ACC_PUBLIC) (. Opcodes ACC_FINAL)) spec))
+      (doseq [spec static+finals]
+        (emit-field (+ (. Opcodes ACC_PUBLIC) (. Opcodes ACC_FINAL) (. Opcodes ACC_STATIC))
+                    (take 2 spec)
+                    (last spec))))
+    (emit-ctor (map (fn [[t n]] [(the-class t) (str n)]) finals))
     [cname (. cv (toByteArray))]))
 
-(def test-options {:name 'rosado.genstruct.test
-                   :factory nil
-                   })
+(defmacro gen-struct
+  "When compiling, generates compiled bytecode for a class with the
+   given package-qualified :name (which, as all names in these
+   parameters, can be a string or a symbol), and writes the .class
+   file to the *compile-path* directory. When not compiling, does
+   nothing. The gen-struct construct contains only instance and static
+   fields.
 
-(binding [*compile-path* "c:/users/roland/dev/clojure/genstruct/target/classes"]
-  (let [options-map test-options
-        [cname bytecode] (generate-struct options-map)]
-    (clojure.lang.Compiler/writeClassFile cname bytecode)))
+  In all subsequent sections taking types, the primitive types can be
+  referred to by their Java names (int, float etc), and classes in the
+  java.lang package can be used without a package qualifier. All other
+  classes must be fully qualified.
 
-(comment
-  (defn- generate-struct []
-    (let [default-options {:load-impl-ns true :impl-ns (ns-name *ns*)}
-          {:keys [name factory load-impl-ns impl-ns]} 
-          (merge default-options options-map)
-          name (str name)
-          super Object
-          cv (new ClassWriter (. ClassWriter COMPUTE_MAXS))
-          cname (. name (replace "." "/"))
-          pkg-name name
-          impl-pkg-name (str impl-ns)
-          impl-cname (.. impl-pkg-name (replace "." "/") (replace \- \_))
-          ctype (. Type (getObjectType cname))
-          iname (fn [#^Class c] (.. Type (getType c) (getInternalName)))
-          totype (fn [#^Class c] (. Type (getType c)))
-          to-types (fn [cs] (if (pos? (count cs))
-                              (into-array (map totype cs))
-                              (make-array Type 0)))
-          obj-type #^Type (totype Object)
-          arg-types (fn [n] (if (pos? n)
-                              (into-array (replicate n obj-type))
-                              (make-array Type 0)))
-          super-type #^Type (totype super)
-          factory-name (str factory)
-          var-name (fn [s] (str s "__var"))
-          class-type  (totype Class)
-          rt-type  (totype clojure.lang.RT)
-          var-type #^Type (totype clojure.lang.Var)
-          ifn-type (totype clojure.lang.IFn)
-          iseq-type (totype clojure.lang.ISeq)
-          ex-type  (totype java.lang.UnsupportedOperationException)
-          var-fields (concat (distinct (concat (keys sigs-by-name)
-                                               (mapcat (fn [[m s]] (map #(overload-name m (map the-class %)) s)) overloads)
-                                               (mapcat (comp (partial map str) vals val) exposes))))
-          emit-get-var (fn [#^GeneratorAdapter gen v]
-                         (let [false-label (. gen newLabel)
-                               end-label (. gen newLabel)]
-                           (. gen getStatic ctype (var-name v) var-type)
-                           (. gen dup)
-                           (. gen invokeVirtual var-type (. Method (getMethod "boolean isBound()")))
-                           (. gen ifZCmp (. GeneratorAdapter EQ) false-label)
-                           (. gen invokeVirtual var-type (. Method (getMethod "Object get()")))
-                           (. gen goTo end-label)
-                           (. gen mark false-label)
-                           (. gen pop)
-                           (. gen visitInsn (. Opcodes ACONST_NULL))
-                           (. gen mark end-label)))
-          emit-unsupported (fn [#^GeneratorAdapter gen #^Method m]
-                             (. gen (throwException ex-type (str (. m (getName)) " ("
-                                                                 impl-pkg-name "/" prefix (.getName m)
-                                                                 " not defined?)"))))
-          emit-forwarding-method
-          (fn [mname pclasses rclass as-static else-gen]
-            (let [pclasses (map the-class pclasses)
-                  rclass (the-class rclass)
-                  ptypes (to-types pclasses)
-                  rtype #^Type (totype rclass)
-                  m (new Method mname rtype ptypes)
-                  is-overload (seq (overloads mname))
-                  gen (new GeneratorAdapter (+ (. Opcodes ACC_PUBLIC) (if as-static (. Opcodes ACC_STATIC) 0)) 
-                           m nil nil cv)
-                  found-label (. gen (newLabel))
-                  else-label (. gen (newLabel))
-                  end-label (. gen (newLabel))]
-              (. gen (visitCode))
-              (if (> (count pclasses) 18)
-                (else-gen gen m)
-                (do
-                  (when is-overload
-                    (emit-get-var gen (overload-name mname pclasses))
-                    (. gen (dup))
-                    (. gen (ifNonNull found-label))
-                    (. gen (pop)))
-                  (emit-get-var gen mname)
-                  (. gen (dup))
-                  (. gen (ifNull else-label))
-                  (when is-overload
-                    (. gen (mark found-label)))
-                                        ;if found
-                  (.checkCast gen ifn-type)
-                  (when-not as-static
-                    (. gen (loadThis)))
-                                        ;box args
-                  (dotimes [i (count ptypes)]
-                    (. gen (loadArg i))
-                    (. clojure.lang.Compiler$HostExpr (emitBoxReturn nil gen (nth pclasses i))))
-                                        ;call fn
-                  (. gen (invokeInterface ifn-type (new Method "invoke" obj-type 
-                                                        (to-types (replicate (+ (count ptypes)
-                                                                                (if as-static 0 1)) 
-                                                                             Object)))))
-                                        ;(into-array (cons obj-type 
-                                        ;                 (replicate (count ptypes) obj-type))))))
-                                        ;unbox return
-                  (. gen (unbox rtype))
-                  (when (= (. rtype (getSort)) (. Type VOID))
-                    (. gen (pop)))
-                  (. gen (goTo end-label))
-                
-                                        ;else call supplied alternative generator
-                  (. gen (mark else-label))
-                  (. gen (pop))
-                
-                  (else-gen gen m)
-            
-                  (. gen (mark end-label))))
-              (. gen (returnValue))
-              (. gen (endMethod))))
-          ])))
+  :name aname
 
+  The package-qualified name of the class to be generated.
 
-(comment
-  ;; usage example
+  :mutable-fields
+
+  A vector of field specs where a field spec is a vector of the form:
+
+      [type name]
+
+  Note that gen-struct does not allow for static non-final fields.
+
+  :final-fields
+
+  A vector of field specs where a field spec is a vector of the form:
+
+      [type name] or [type static name :is value].
+
+  Final non-static fields will have to be initialized by passing an
+  appropriate argument to the constructor (in order the fields appear
+  in the definition). 
+
+  Final static fields can only be of one of the primitive types.
+
+  Example:
+
   (gen-struct
-   :name rosado.genstruct.example
-   :fields [[static float MAX_HEIGHT]
-            [float x]
-            [float y]])
-  ;; 
-  (gen-class
-   :name clojure.examples.impl
-   :implements [clojure.examples.IBar]
-   :prefix "impl-"
-   :methods [[foo [] String]])
+    :name my.ns.struct
+    :mutable-fields [[float x]
+                     [float y]]
+    :final-fields [[int timeout]
+                   [static int MAX_TIMEOUT_MS :is 1000]
+                   [java.io.File input]])
+  "
+  [& options]
+  (when *compile-files*
+    (let [options-map (apply hash-map options)
+          [cname bytecode] (generate-struct options-map)]
+      (clojure.lang.Compiler/writeClassFile cname bytecode))))
+
+(comment
+  (gen-struct
+   :name rosado.genstruct.test111
+   :mutable-fields [[float x]
+                    [float y]]
+   :final-fields [[static double K :is 23.0]
+                  [static int MAX_X :is 1000]
+                  [double maxAmount]])
+
+  (gen-struct
+   :name rosado.genstruct.test201
+   :mutable-fields [[float x]
+                    [float y]]
+   :final-fields [[int timeout]
+                  [static int MAX_TIMEOUT_MS :is 1000]
+                  [java.io.File input]])
   )
+
