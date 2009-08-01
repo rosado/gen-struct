@@ -69,7 +69,6 @@
 
 (defn- generate-struct
   [options-map]
-  (println "generate-struct")
   (let [default-options {}
         {:keys [name mutable-fields final-fields]} 
         (merge default-options options-map)
@@ -113,7 +112,7 @@
                              (recur (first specs) (rest specs) (conj st (rm-static sp)) inst)
                              (recur (first specs) (rest specs) st (conj inst sp)))
                            [st inst])))
-        [mutables static+mutables] (split-fields mutable-fields)
+        [static+mutables mutables] (split-fields mutable-fields)
         [static+finals finals] (split-fields final-fields)
         ]
     (validate-options options-map)
