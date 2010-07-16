@@ -1,2 +1,5 @@
 A brief explanation here: 
 http://www.haltingproblem.net/weblog/2009/08/03/making-clojure-a-bit-more-mutable/
+
+This project is no longer maintained. Clojure evolved enough for this 
+project to be unncecessary. 
